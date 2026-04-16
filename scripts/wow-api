@@ -1,0 +1,344 @@
+#!/usr/bin/env node
+//
+// scripts/wow-api
+// Verify WoW API calls against Blizzard's live generated API documentation.
+//
+// USAGE
+//   scripts/wow-api                            Bulk-verify every C_*.Func call
+//                                              in the current addon tree.
+//   scripts/wow-api GetQuestObjectives         Look up a specific function.
+//   scripts/wow-api -v GetQuestObjectives      Verbose: full signature + docs.
+//   scripts/wow-api -l C_QuestLog              List all functions in a namespace.
+//   scripts/wow-api -u                         Force-refresh the cache.
+//
+// CACHE
+//   First run downloads the ~575 Lua doc files from Gethe/wow-ui-source (live
+//   branch) into ./api-cache/.  Subsequent runs grep locally.  `-u` refreshes
+//   when Blizzard ships a patch.  Cache is gitignored by default.
+//
+// EXIT
+//   0 — all queried APIs exist.
+//   1 — at least one API was not found.
+//   2 — cache or network error.
+
+const fs    = require("fs");
+const path  = require("path");
+const https = require("https");
+
+const REPO_ROOT = path.resolve(__dirname, "..");
+const CACHE_DIR = path.join(REPO_ROOT, "api-cache");
+const INDEX_URL = "https://api.github.com/repos/Gethe/wow-ui-source/contents/Interface/AddOns/Blizzard_APIDocumentationGenerated?ref=live";
+const RAW_BASE  = "https://raw.githubusercontent.com/Gethe/wow-ui-source/live/Interface/AddOns/Blizzard_APIDocumentationGenerated";
+
+// ─── HTTP ────────────────────────────────────────────────────────────────────
+
+function fetch(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: { "User-Agent": "wow-api-resources/1.0" },
+      ...opts,
+    }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetch(res.headers.location, opts).then(resolve, reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`HTTP ${res.statusCode}: ${url}`));
+      }
+      let data = "";
+      res.on("data", (c) => data += c);
+      res.on("end", () => resolve(data));
+    });
+    req.on("error", reject);
+  });
+}
+
+// ─── Cache ───────────────────────────────────────────────────────────────────
+
+async function refreshCache({ verbose = true } = {}) {
+  if (verbose) console.log("Fetching API doc index from Gethe/wow-ui-source live branch...");
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+
+  const index = JSON.parse(await fetch(INDEX_URL));
+  const files = index.filter(e => e.name.endsWith(".lua")).map(e => e.name);
+  if (verbose) console.log(`  ${files.length} doc files to download`);
+
+  let done = 0;
+  let failed = 0;
+  for (const f of files) {
+    try {
+      const body = await fetch(`${RAW_BASE}/${f}`);
+      fs.writeFileSync(path.join(CACHE_DIR, f), body);
+      done++;
+      if (verbose && done % 50 === 0) console.log(`  ${done}/${files.length}...`);
+    } catch (e) {
+      failed++;
+      if (verbose) console.error(`  SKIP ${f}: ${e.message}`);
+    }
+  }
+
+  // Write a snapshot marker with date and file count
+  const marker = {
+    fetched_at: new Date().toISOString(),
+    file_count: done,
+    failed_count: failed,
+    source: "Gethe/wow-ui-source live branch",
+  };
+  fs.writeFileSync(path.join(CACHE_DIR, ".snapshot.json"), JSON.stringify(marker, null, 2));
+
+  if (verbose) console.log(`Cached ${done} files (${failed} failed) to ${path.relative(REPO_ROOT, CACHE_DIR)}/`);
+}
+
+function cacheFiles() {
+  if (!fs.existsSync(CACHE_DIR)) return null;
+  return fs.readdirSync(CACHE_DIR).filter(f => f.endsWith(".lua"));
+}
+
+async function ensureCache() {
+  const files = cacheFiles();
+  if (!files || files.length === 0) await refreshCache();
+}
+
+// ─── Find ────────────────────────────────────────────────────────────────────
+
+/**
+ * Search the cache for a function definition.  Returns a list of
+ * { file, namespace, funcName, startLine, body } entries.
+ */
+function findFunction(funcName) {
+  const files = cacheFiles();
+  if (!files) return [];
+  const hits = [];
+
+  for (const fname of files) {
+    const content = fs.readFileSync(path.join(CACHE_DIR, fname), "utf8");
+    const needle = `Name = "${funcName}"`;
+    let idx = content.indexOf(needle);
+    while (idx !== -1) {
+      // Find the enclosing function block: walk backwards to find `{`
+      // of the function table, forwards to the matching `}`.
+      const startLine = content.substring(0, idx).split("\n").length;
+
+      // Namespace is defined at the top of the file: Namespace = "C_*"
+      const nsMatch = content.match(/Namespace\s*=\s*"(C_[A-Za-z]+)"/);
+      const namespace = nsMatch ? nsMatch[1] : null;
+
+      // Extract the block from preceding `{` to matching `}` for verbose output
+      const body = extractBlock(content, idx);
+
+      hits.push({ file: fname, namespace, funcName, startLine, body });
+      idx = content.indexOf(needle, idx + needle.length);
+    }
+  }
+
+  return hits;
+}
+
+/**
+ * Extract a balanced { ... } block containing position `pos`.
+ * Walks backwards from pos to find opening `{`, then matches braces forward.
+ */
+function extractBlock(content, pos) {
+  // Walk back to find the opening `{` of the function entry
+  let openIdx = pos;
+  while (openIdx > 0 && content[openIdx] !== "{") openIdx--;
+  // Match braces forward
+  let depth = 0;
+  for (let i = openIdx; i < content.length; i++) {
+    if (content[i] === "{") depth++;
+    else if (content[i] === "}") {
+      depth--;
+      if (depth === 0) return content.substring(openIdx, i + 1);
+    }
+  }
+  return content.substring(openIdx, pos + 200); // fallback
+}
+
+/**
+ * List all function names declared in a namespace (e.g. "C_QuestLog").
+ */
+function listNamespace(namespace) {
+  const files = cacheFiles();
+  if (!files) return [];
+  const results = [];
+
+  for (const fname of files) {
+    const content = fs.readFileSync(path.join(CACHE_DIR, fname), "utf8");
+    if (!content.includes(`Namespace = "${namespace}"`)) continue;
+
+    // Match all Name = "Foo" entries inside the Functions block
+    const funcs = [];
+    const funcsBlockMatch = content.match(/Functions\s*=\s*\{([\s\S]*?)\n\s*\}\s*,?\s*\n?\s*(?:Tables|Events|\};)/);
+    const haystack = funcsBlockMatch ? funcsBlockMatch[1] : content;
+
+    const re = /Name\s*=\s*"([A-Z][A-Za-z0-9_]+)"/g;
+    let m;
+    while ((m = re.exec(haystack))) funcs.push(m[1]);
+    results.push({ file: fname, functions: [...new Set(funcs)].sort() });
+  }
+  return results;
+}
+
+/**
+ * Walk the parent tree looking for all C_Namespace.Func calls in .lua files.
+ */
+function extractAddonAPICalls(root) {
+  const addonFiles = [];
+  const skip = new Set([
+    "libs", "node_modules", ".claude", ".git", ".api-cache",
+    "api-cache", "fonts", "textures", "target", "dist",
+  ]);
+
+  function walk(dir) {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (skip.has(e.name)) continue;
+        walk(full);
+      } else if (e.name.endsWith(".lua") && !full.startsWith(CACHE_DIR)) {
+        addonFiles.push(full);
+      }
+    }
+  }
+  try { walk(root); } catch { /* no files */ }
+
+  const found = new Map();
+  const re = /\b(C_[A-Za-z]+)\.([A-Z][A-Za-z0-9]+)/g;
+  for (const file of addonFiles) {
+    const lines = fs.readFileSync(file, "utf8").split("\n");
+    lines.forEach((line, i) => {
+      let m;
+      while ((m = re.exec(line))) {
+        const key = `${m[1]}.${m[2]}`;
+        if (!found.has(key)) found.set(key, []);
+        found.get(key).push({ file: path.relative(root, file), line: i + 1 });
+      }
+    });
+  }
+  return found;
+}
+
+// ─── Commands ────────────────────────────────────────────────────────────────
+
+function cmdLookup(funcName, verbose) {
+  const hits = findFunction(funcName);
+  if (hits.length === 0) {
+    console.log(`NOT FOUND: ${funcName}`);
+    console.log("");
+    console.log("This function is not in Blizzard's generated API docs for the");
+    console.log("live (Midnight) branch.  Possible reasons:");
+    console.log("  • It was removed in a recent patch.");
+    console.log("  • It's a legacy global (not in the C_* namespaces) — the");
+    console.log("    generated docs only cover modern C_* APIs.  Check the");
+    console.log("    Lua source in Gethe/wow-ui-source or warcraft.wiki.gg:");
+    console.log(`    https://warcraft.wiki.gg/wiki/API_${funcName}`);
+    console.log("  • You mistyped the name.");
+    process.exit(1);
+  }
+  for (const h of hits) {
+    const ns = h.namespace ? `${h.namespace}.` : "";
+    console.log(`[${h.file}]`);
+    if (verbose) {
+      console.log(h.body);
+    } else {
+      console.log(`  ${h.startLine}: ${ns}${h.funcName}`);
+    }
+    console.log("");
+  }
+}
+
+function cmdListNamespace(namespace) {
+  const results = listNamespace(namespace);
+  if (results.length === 0) {
+    console.log(`No namespace ${namespace} found in cache.`);
+    process.exit(1);
+  }
+  for (const r of results) {
+    console.log(`[${r.file}]`);
+    for (const f of r.functions) {
+      console.log(`  ${namespace}.${f}`);
+    }
+    console.log("");
+  }
+}
+
+function cmdBulkVerify() {
+  const used = extractAddonAPICalls(process.cwd());
+  if (used.size === 0) {
+    console.log("No C_* API calls found in the current directory tree.");
+    console.log("Run this from an addon repo root, or pass a function name:");
+    console.log("  scripts/wow-api GetQuestObjectives");
+    return;
+  }
+
+  const ok = [];
+  const missing = [];
+  for (const [key, locations] of [...used.entries()].sort()) {
+    const [, funcName] = key.split(".");
+    const hits = findFunction(funcName);
+    if (hits.length > 0) ok.push(key);
+    else missing.push({ key, locations });
+  }
+
+  console.log(`${ok.length} APIs verified in generated docs:`);
+  ok.forEach(k => console.log(`  OK       ${k}`));
+
+  if (missing.length > 0) {
+    console.log("");
+    console.log(`${missing.length} APIs not in generated docs:`);
+    for (const { key, locations } of missing) {
+      console.log(`  MISSING  ${key}`);
+      locations.slice(0, 3).forEach(l => console.log(`           at ${l.file}:${l.line}`));
+    }
+    console.log("");
+    console.log("Missing APIs may still exist as legacy globals (the generated");
+    console.log("docs only cover C_* namespaces).  Verify each against the wiki:");
+    console.log("  https://warcraft.wiki.gg/wiki/API_<FunctionName>");
+  }
+
+  process.exit(missing.length > 0 ? 1 : 0);
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  if (args.includes("-u") || args.includes("--update")) {
+    try { await refreshCache(); } catch (e) {
+      console.error(`Cache refresh failed: ${e.message}`);
+      process.exit(2);
+    }
+    return;
+  }
+
+  const verbose = args.includes("-v") || args.includes("--verbose");
+  const nsMode  = args.includes("-l") || args.includes("--list");
+  const target  = args.find(a => !a.startsWith("-"));
+
+  await ensureCache().catch(e => {
+    console.error(`Cache error: ${e.message}`);
+    console.error(`Try: scripts/wow-api -u`);
+    process.exit(2);
+  });
+
+  if (nsMode) {
+    if (!target) {
+      console.error("Usage: scripts/wow-api -l C_NamespaceName");
+      process.exit(2);
+    }
+    cmdListNamespace(target);
+    return;
+  }
+
+  if (target) {
+    cmdLookup(target, verbose);
+    return;
+  }
+
+  cmdBulkVerify();
+}
+
+main().catch(e => {
+  console.error(e);
+  process.exit(2);
+});

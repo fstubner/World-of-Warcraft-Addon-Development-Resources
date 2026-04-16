@@ -1,0 +1,6 @@
+node_modules/
+
+# API doc cache (~30 MB, regenerable via `scripts/wow-api -u`).
+# Committing regenerable content bloats the repo; the script handles
+# download-on-first-use transparently.
+api-cache/
